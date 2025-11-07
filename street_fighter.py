@@ -37,6 +37,18 @@ ATTACK_COOLDOWN = 20  # Frames between successive attacks
 ATTACK_DAMAGE = 12
 MAX_HEALTH = 100
 
+# Dodge mechanics
+DODGE_DURATION = 15  # Frames of dodge invincibility
+DODGE_COOLDOWN = 90  # Frames before next dodge
+DODGE_SPEED = 12  # Speed during dodge
+
+# Special skill mechanics
+SKILL_DAMAGE = 25  # Damage dealt by special skills
+SKILL_COOLDOWN = 180  # Frames (3 seconds at 60 FPS)
+SKILL_ENERGY_COST = 50  # Energy required to use skill
+MAX_ENERGY = 100  # Maximum energy
+ENERGY_REGEN_RATE = 0.3  # Energy regenerated per frame
+
 # File storing leaderboard data. The file is placed beside the script so that the
 # game can be launched from any working directory without losing track of the data.
 LEADERBOARD_FILE = os.path.join(os.path.dirname(__file__), "leaderboard.json")
@@ -112,7 +124,7 @@ class ControlScheme:
 
     Attributes
     ----------
-    left, right, jump, attack: int
+    left, right, jump, attack, dodge, skill: int
         ``pygame`` key constants for each action.
     """
 
@@ -120,11 +132,13 @@ class ControlScheme:
     right: int
     jump: int
     attack: int
+    dodge: int
+    skill: int
 
 
 @dataclass
 class Fighter:
-    """A simple rectangle-based fighter with jump and attack abilities."""
+    """A simple rectangle-based fighter with jump, attack, dodge, and special skill abilities."""
 
     name: str
     color: Tuple[int, int, int]
@@ -136,6 +150,15 @@ class Fighter:
     on_ground: bool = field(default=True)
     attack_cooldown: int = field(default=0)
     health: int = field(default=MAX_HEALTH)
+
+    # Dodge mechanics
+    is_dodging: bool = field(default=False)
+    dodge_timer: int = field(default=0)
+    dodge_cooldown: int = field(default=0)
+
+    # Special skill mechanics
+    energy: float = field(default=MAX_ENERGY)
+    skill_cooldown: int = field(default=0)
 
     def __post_init__(self) -> None:
         # Fighters are represented by rectangles 60x120 pixels.
@@ -157,6 +180,10 @@ class Fighter:
     def handle_movement(self, keys_pressed: pygame.key.ScancodeWrapper) -> None:
         """Move fighter horizontally and handle jumping input."""
 
+        # Cannot move normally while dodging
+        if self.is_dodging:
+            return
+
         # Horizontal movement responds directly to held keys.
         if keys_pressed[self.controls.left]:
             self.rect.x -= PLAYER_SPEED
@@ -173,11 +200,41 @@ class Fighter:
             self.on_ground = False
             self.velocity_y = -JUMP_STRENGTH
 
+    def handle_dodge(self, keys_pressed: pygame.key.ScancodeWrapper) -> None:
+        """Handle dodge mechanics with invincibility frames."""
+
+        # Update dodge cooldown
+        if self.dodge_cooldown > 0:
+            self.dodge_cooldown -= 1
+
+        # Update active dodge
+        if self.is_dodging:
+            self.dodge_timer -= 1
+            # Move quickly in facing direction during dodge
+            dodge_direction = 1 if self.facing_right else -1
+            self.rect.x += DODGE_SPEED * dodge_direction
+            self.rect.x = max(0, min(self.rect.x, WIDTH - self.rect.width))
+
+            if self.dodge_timer <= 0:
+                self.is_dodging = False
+        else:
+            # Trigger new dodge if key pressed and cooldown ready
+            if keys_pressed[self.controls.dodge] and self.dodge_cooldown == 0 and self.on_ground:
+                self.is_dodging = True
+                self.dodge_timer = DODGE_DURATION
+                self.dodge_cooldown = DODGE_COOLDOWN
+
+    def regenerate_energy(self) -> None:
+        """Gradually regenerate energy over time."""
+
+        if self.energy < MAX_ENERGY:
+            self.energy = min(self.energy + ENERGY_REGEN_RATE, MAX_ENERGY)
+
     def attempt_attack(self, opponent: "Fighter", keys_pressed: pygame.key.ScancodeWrapper) -> bool:
         """Perform an attack if the cooldown permits.
 
         Returns ``True`` when the attack successfully hits the opponent, allowing
-        the caller to apply damage.
+        the caller to apply damage. Returns ``False`` if opponent is dodging.
         """
 
         if self.attack_cooldown > 0:
@@ -197,16 +254,60 @@ class Fighter:
                     self.rect.left - ATTACK_RANGE, self.rect.top + 20, ATTACK_RANGE, self.rect.height - 40
                 )
 
-            if attack_rect.colliderect(opponent.rect):
+            # Check if hit connects and opponent is not dodging (invincible)
+            if attack_rect.colliderect(opponent.rect) and not opponent.is_dodging:
                 return True
+
+        return False
+
+    def attempt_special_skill(self, opponent: "Fighter", keys_pressed: pygame.key.ScancodeWrapper) -> bool:
+        """Perform a special skill attack if energy and cooldown permit.
+
+        Returns ``True`` when the skill successfully hits the opponent.
+        """
+
+        # Update skill cooldown
+        if self.skill_cooldown > 0:
+            self.skill_cooldown -= 1
+            return False
+
+        # Check if skill key pressed and requirements met
+        if keys_pressed[self.controls.skill]:
+            if self.energy >= SKILL_ENERGY_COST and self.skill_cooldown == 0:
+                # Consume energy and set cooldown
+                self.energy -= SKILL_ENERGY_COST
+                self.skill_cooldown = SKILL_COOLDOWN
+
+                # Create larger hitbox for special skill
+                skill_range = ATTACK_RANGE * 1.5
+                if self.facing_right:
+                    skill_rect = pygame.Rect(
+                        self.rect.right, self.rect.top, skill_range, self.rect.height
+                    )
+                else:
+                    skill_rect = pygame.Rect(
+                        self.rect.left - skill_range, self.rect.top, skill_range, self.rect.height
+                    )
+
+                # Check if skill hits and opponent is not dodging
+                if skill_rect.colliderect(opponent.rect) and not opponent.is_dodging:
+                    return True
 
         return False
 
     def draw(self, surface: pygame.Surface) -> None:
         """Render the fighter and a simple outline."""
 
-        pygame.draw.rect(surface, self.color, self.rect)
-        pygame.draw.rect(surface, WHITE, self.rect, 2)
+        # If dodging, make the fighter semi-transparent (visual feedback)
+        if self.is_dodging:
+            # Create a surface with alpha channel for transparency
+            dodge_surface = pygame.Surface((self.rect.width, self.rect.height), pygame.SRCALPHA)
+            dodge_surface.fill((*self.color, 128))  # 50% opacity
+            surface.blit(dodge_surface, self.rect.topleft)
+            pygame.draw.rect(surface, WHITE, self.rect, 2)
+        else:
+            pygame.draw.rect(surface, self.color, self.rect)
+            pygame.draw.rect(surface, WHITE, self.rect, 2)
 
 
 # --------------------------------------------------------------------------------------
@@ -228,37 +329,53 @@ def render_text(surface: pygame.Surface, text: str, pos: Tuple[int, int], size: 
 
 
 def draw_health_bars(surface: pygame.Surface, fighters: Tuple[Fighter, Fighter]) -> None:
-    """Draw health bars for each fighter at the top of the screen."""
+    """Draw health bars and energy bars for each fighter at the top of the screen."""
 
     bar_width = 300
     bar_height = 24
     padding = 30
+    bar_spacing = 30  # Space between health and energy bars
 
     for index, fighter in enumerate(fighters):
-        # Compute filled portion as a percentage of remaining health.
-        health_ratio = max(fighter.health, 0) / MAX_HEALTH
-        filled_width = int(bar_width * health_ratio)
-
         x = padding if index == 0 else WIDTH - bar_width - padding
         y = padding
 
+        # Draw health bar
+        health_ratio = max(fighter.health, 0) / MAX_HEALTH
+        health_filled = int(bar_width * health_ratio)
+
         pygame.draw.rect(surface, GREY, (x, y, bar_width, bar_height))
-        pygame.draw.rect(surface, GREEN, (x, y, filled_width, bar_height))
+        pygame.draw.rect(surface, GREEN, (x, y, health_filled, bar_height))
         pygame.draw.rect(surface, WHITE, (x, y, bar_width, bar_height), 2)
         render_text(surface, f"{fighter.name}: {fighter.health} HP", (x, y - 26), size=24)
+
+        # Draw energy bar
+        energy_y = y + bar_height + 8
+        energy_ratio = max(fighter.energy, 0) / MAX_ENERGY
+        energy_filled = int(bar_width * energy_ratio)
+
+        pygame.draw.rect(surface, GREY, (x, energy_y, bar_width, bar_height - 4))
+        pygame.draw.rect(surface, (100, 150, 255), (x, energy_y, energy_filled, bar_height - 4))
+        pygame.draw.rect(surface, WHITE, (x, energy_y, bar_width, bar_height - 4), 2)
+
+        # Show skill cooldown indicator if skill is on cooldown
+        if fighter.skill_cooldown > 0:
+            cooldown_text = f"技能冷却: {fighter.skill_cooldown // FPS + 1}s"
+            render_text(surface, cooldown_text, (x, energy_y + bar_height + 2), size=18, color=(255, 200, 100))
 
 
 def draw_instructions_overlay(surface: pygame.Surface) -> None:
     """Render a fixed instructions panel at the bottom of the screen."""
 
-    overlay_rect = pygame.Rect(0, HEIGHT - 140, WIDTH, 140)
+    overlay_rect = pygame.Rect(0, HEIGHT - 160, WIDTH, 160)
     pygame.draw.rect(surface, (20, 20, 20), overlay_rect)
     pygame.draw.rect(surface, WHITE, overlay_rect, 2)
 
-    render_text(surface, "控制指引 / Controls", (WIDTH // 2, HEIGHT - 130), size=32, center=True)
-    render_text(surface, "玩家1: A/D移动, W跳跃, F攻击", (40, HEIGHT - 100), size=26)
-    render_text(surface, "玩家2: ←/→移动, ↑跳跃, K攻击", (40, HEIGHT - 70), size=26)
-    render_text(surface, "按ESC返回主菜单", (40, HEIGHT - 40), size=24)
+    render_text(surface, "控制指引 / Controls", (WIDTH // 2, HEIGHT - 150), size=32, center=True)
+    render_text(surface, "玩家1: A/D移动, W跳跃, F攻击, G闪避, H技能", (30, HEIGHT - 115), size=24)
+    render_text(surface, "玩家2: ←/→移动, ↑跳跃, K攻击, L闪避, ;技能", (30, HEIGHT - 85), size=24)
+    render_text(surface, "提示: 技能需要50能量, 闪避时无敌", (30, HEIGHT - 55), size=22, color=(150, 255, 150))
+    render_text(surface, "按ESC返回主菜单", (30, HEIGHT - 30), size=22)
 
 
 def draw_leaderboard(surface: pygame.Surface, leaderboard: List[Dict[str, int]]) -> None:
@@ -351,14 +468,16 @@ def instructions_screen(screen: pygame.Surface, clock: pygame.time.Clock, names:
                     return True
 
         screen.fill(BLACK)
-        render_text(screen, "街头霸王 - 对战指南", (WIDTH // 2, 100), size=52, center=True)
-        render_text(screen, f"玩家1: {names[0]}", (WIDTH // 2, 180), size=36, center=True)
-        render_text(screen, f"玩家2: {names[1]}", (WIDTH // 2, 220), size=36, center=True)
+        render_text(screen, "街头霸王 - 对战指南", (WIDTH // 2, 80), size=52, center=True)
+        render_text(screen, f"玩家1: {names[0]}", (WIDTH // 2, 160), size=36, center=True)
+        render_text(screen, f"玩家2: {names[1]}", (WIDTH // 2, 200), size=36, center=True)
 
-        render_text(screen, "控制: 玩家1 A/D 左右, W 跳跃, F 攻击", (WIDTH // 2, 300), size=30, center=True)
-        render_text(screen, "控制: 玩家2 ←/→ 左右, ↑ 跳跃, K 攻击", (WIDTH // 2, 340), size=30, center=True)
-        render_text(screen, "按 空格 或 回车 开始对战", (WIDTH // 2, 420), size=32, center=True)
-        render_text(screen, "按 ESC 返回上一页", (WIDTH // 2, 460), size=28, center=True)
+        render_text(screen, "控制: 玩家1 A/D 左右, W 跳跃, F 攻击, G 闪避, H 技能", (WIDTH // 2, 270), size=28, center=True)
+        render_text(screen, "控制: 玩家2 ←/→ 左右, ↑ 跳跃, K 攻击, L 闪避, ; 技能", (WIDTH // 2, 310), size=28, center=True)
+        render_text(screen, "技能: 消耗50能量, 造成25伤害 (能量自动恢复)", (WIDTH // 2, 360), size=24, center=True, color=(100, 200, 255))
+        render_text(screen, "闪避: 无敌状态, 快速移动, 有冷却时间", (WIDTH // 2, 390), size=24, center=True, color=(150, 255, 150))
+        render_text(screen, "按 空格 或 回车 开始对战", (WIDTH // 2, 450), size=32, center=True)
+        render_text(screen, "按 ESC 返回上一页", (WIDTH // 2, 490), size=28, center=True)
 
         pygame.display.flip()
         clock.tick(FPS)
@@ -378,14 +497,28 @@ def gameplay_loop(screen: pygame.Surface, clock: pygame.time.Clock, names: Tuple
         Fighter(
             name=names[0],
             color=SOFT_RED,
-            controls=ControlScheme(pygame.K_a, pygame.K_d, pygame.K_w, pygame.K_f),
+            controls=ControlScheme(
+                left=pygame.K_a,
+                right=pygame.K_d,
+                jump=pygame.K_w,
+                attack=pygame.K_f,
+                dodge=pygame.K_g,
+                skill=pygame.K_h
+            ),
             start_pos=(WIDTH // 4, GROUND_LEVEL - 120),
             facing_right=True,
         ),
         Fighter(
             name=names[1],
             color=SOFT_BLUE,
-            controls=ControlScheme(pygame.K_LEFT, pygame.K_RIGHT, pygame.K_UP, pygame.K_k),
+            controls=ControlScheme(
+                left=pygame.K_LEFT,
+                right=pygame.K_RIGHT,
+                jump=pygame.K_UP,
+                attack=pygame.K_k,
+                dodge=pygame.K_l,
+                skill=pygame.K_SEMICOLON
+            ),
             start_pos=(3 * WIDTH // 4, GROUND_LEVEL - 120),
             facing_right=False,
         ),
@@ -400,16 +533,24 @@ def gameplay_loop(screen: pygame.Surface, clock: pygame.time.Clock, names: Tuple
 
         keys_pressed = pygame.key.get_pressed()
 
-        # Update fighters sequentially: movement -> gravity -> attack resolution.
+        # Update fighters sequentially: movement -> gravity -> dodge -> energy regen
         for fighter in players:
             fighter.handle_movement(keys_pressed)
             fighter.apply_gravity()
+            fighter.handle_dodge(keys_pressed)
+            fighter.regenerate_energy()
 
         # Check attack collisions in both directions.
         if players[0].attempt_attack(players[1], keys_pressed):
             players[1].health -= ATTACK_DAMAGE
         if players[1].attempt_attack(players[0], keys_pressed):
             players[0].health -= ATTACK_DAMAGE
+
+        # Check special skill collisions in both directions.
+        if players[0].attempt_special_skill(players[1], keys_pressed):
+            players[1].health -= SKILL_DAMAGE
+        if players[1].attempt_special_skill(players[0], keys_pressed):
+            players[0].health -= SKILL_DAMAGE
 
         # Determine if a player has been knocked out.
         for fighter in players:
